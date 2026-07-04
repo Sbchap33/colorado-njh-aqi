@@ -1,0 +1,1 @@
+# Uses Python standard library only. Requires curl on PATH.
