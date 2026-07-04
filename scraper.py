@@ -20,7 +20,9 @@ from typing import List, Optional
 from notify import NotifyConfig, send_notification
 
 URL = "https://www.colorado.gov/airquality/air_quality.aspx"
+AQI_DETAIL_URL = "https://www.colorado.gov/airquality/aqi_detail.aspx"
 SITE_CODE = "NJH"
+SITE_AREA = "Denver"
 USER_AGENT = "colorado-njh-aqi-scraper/1.0 (+local monitoring)"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "data" / "njh_aqi.csv"
 
@@ -54,46 +56,30 @@ def _clean_cell(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _extract_current_hour_section(html: str) -> str:
-    current_start = html.find("Current Hour:")
-    if current_start == -1:
-        raise ValueError("Could not find 'Current Hour:' section on page")
 
-    daily_start = html.find("Daily Highs:", current_start)
-    if daily_start == -1:
-        return html[current_start:]
-    return html[current_start:daily_start]
+def _parse_table_row_cells(row_html: str) -> List[str]:
+    return [
+        _clean_cell(cell)
+        for cell in re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL | re.IGNORECASE)
+    ]
 
 
-def parse_njh_reading(html: str, scraped_at: Optional[datetime] = None) -> NjhReading:
-    section = _extract_current_hour_section(html)
-    row_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
-    site_link = re.compile(
-        rf'site_description\.aspx#{SITE_CODE}">{SITE_CODE}</a>',
-        re.IGNORECASE,
-    )
-
-    match = None
-    for row_match in row_pattern.finditer(section):
-        if site_link.search(row_match.group(1)):
-            match = row_match
-            break
-
-    if not match:
-        raise ValueError(f"Could not find {SITE_CODE} row in Current Hour table")
-
-    cells = re.findall(r"<td[^>]*>(.*?)</td>", match.group(1), re.DOTALL | re.IGNORECASE)
+def _reading_from_summary_row(
+    cells: List[str],
+    scraped_at: Optional[datetime],
+    source_url: str,
+) -> NjhReading:
     if len(cells) < 7:
         raise ValueError(f"Unexpected table structure for {SITE_CODE}: {len(cells)} cells")
 
-    area = re.sub(r"\[expand\s*\+\s*\]", "", _clean_cell(cells[0])).strip()
-    site = _clean_cell(cells[1])
-    air_quality = _clean_cell(cells[2])
-    max_aqi_text = _clean_cell(cells[3])
-    pollutant = _clean_cell(cells[4])
-    concentration = _clean_cell(cells[5])
-    period = _clean_cell(cells[6])
-    report_time_mst = _clean_cell(cells[7]) if len(cells) > 7 else None
+    area = re.sub(r"\[expand\s*\+\s*\]", "", cells[0]).strip()
+    site = cells[1]
+    air_quality = cells[2]
+    max_aqi_text = cells[3]
+    pollutant = cells[4]
+    concentration = cells[5]
+    period = cells[6]
+    report_time_mst = cells[7] if len(cells) > 7 else None
 
     if site != SITE_CODE:
         raise ValueError(f"Expected site {SITE_CODE}, found {site!r}")
@@ -114,13 +100,108 @@ def parse_njh_reading(html: str, scraped_at: Optional[datetime] = None) -> NjhRe
         concentration=concentration,
         period=period,
         report_time_mst=report_time_mst,
-        source_url=URL,
+        source_url=source_url,
+    )
+
+
+def _find_summary_row(html: str) -> Optional[List[str]]:
+    row_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+    site_link = re.compile(
+        rf'site_description\.aspx#{SITE_CODE}">{SITE_CODE}</a>',
+        re.IGNORECASE,
+    )
+
+    for section_name, section in _summary_sections(html):
+        for row_match in row_pattern.finditer(section):
+            if not site_link.search(row_match.group(1)):
+                continue
+            cells = _parse_table_row_cells(row_match.group(1))
+            if cells:
+                logging.debug("Found %s in %s summary section", SITE_CODE, section_name)
+                return cells
+    return None
+
+
+def _summary_sections(html: str) -> List[tuple]:
+    sections: List[tuple] = []
+    current_start = html.find("Current Hour:")
+    daily_start = html.find("Daily Highs:")
+
+    if current_start != -1:
+        if daily_start != -1:
+            sections.append(("Current Hour", html[current_start:daily_start]))
+        else:
+            sections.append(("Current Hour", html[current_start:]))
+
+    if daily_start != -1:
+        sections.append(("Daily Highs", html[daily_start:]))
+
+    return sections
+
+
+def parse_njh_reading(html: str, scraped_at: Optional[datetime] = None) -> NjhReading:
+    cells = _find_summary_row(html)
+    if cells is None:
+        raise ValueError(f"Could not find {SITE_CODE} row in air quality summary")
+
+    return _reading_from_summary_row(cells, scraped_at, URL)
+
+
+def parse_njh_aqi_detail(html: str, scraped_at: Optional[datetime] = None) -> NjhReading:
+    row_pattern = re.compile(r"<tr[^>]*>(.*?)</tr>", re.IGNORECASE | re.DOTALL)
+    njh_rows: List[List[str]] = []
+
+    for row_match in row_pattern.finditer(html):
+        cells = _parse_table_row_cells(row_match.group(1))
+        if len(cells) < 7 or cells[1] != SITE_CODE:
+            continue
+        njh_rows.append(cells)
+
+    if not njh_rows:
+        raise ValueError(f"Could not find {SITE_CODE} rows on AQI detail page")
+
+    latest_time = njh_rows[0][0]
+    latest_rows = [row for row in njh_rows if row[0] == latest_time]
+
+    def aqi_value(row: List[str]) -> int:
+        try:
+            return int(row[5])
+        except ValueError:
+            return -1
+
+    best = max(latest_rows, key=aqi_value)
+    interval = best[3]
+    period = f"{interval}-hour" if interval.isdigit() else interval
+
+    timestamp = scraped_at or datetime.now(timezone.utc)
+    return NjhReading(
+        scraped_at=timestamp.isoformat(),
+        site=SITE_CODE,
+        area=SITE_AREA,
+        air_quality=best[4],
+        max_aqi=int(best[5]),
+        pollutant=best[2],
+        concentration=best[6],
+        period=period,
+        report_time_mst=best[0],
+        source_url=AQI_DETAIL_URL,
     )
 
 
 def scrape_njh_aqi() -> NjhReading:
-    html = fetch_page()
-    return parse_njh_reading(html)
+    html = fetch_page(URL)
+    try:
+        return parse_njh_reading(html)
+    except ValueError as exc:
+        if f"Could not find {SITE_CODE}" not in str(exc):
+            raise
+        logging.info(
+            "%s not listed on air quality summary; falling back to AQI detail page",
+            SITE_CODE,
+        )
+
+    detail_html = fetch_page(AQI_DETAIL_URL)
+    return parse_njh_aqi_detail(detail_html)
 
 
 def append_csv(reading: NjhReading, output_path: Path) -> None:
