@@ -8,6 +8,7 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>/Users/samuelchapman/Documents/CursorCode/colorado-njh-aqi/scraper.py</string>
+        <string>--once</string>
     </array>
     <key>StartInterval</key>
     <integer>3600</integer>
